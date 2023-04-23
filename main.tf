@@ -36,7 +36,7 @@ resource "aws_s3_bucket_logging" "this" {
 }
 
 resource "aws_s3_bucket_acl" "this" {
-  count = local.create_bucket && ((var.acl != null && var.acl != "null") || length(local.grants) > 0) ? 1 : 0
+  count = local.create_bucket && ((var.acl != null && var.acl != "null") || length(local.grants) > 0) && var.object_ownership != "BucketOwnerEnforced" ? 1 : 0
 
   bucket                = aws_s3_bucket.this[0].id
   expected_bucket_owner = var.expected_bucket_owner
@@ -69,6 +69,8 @@ resource "aws_s3_bucket_acl" "this" {
       }
     }
   }
+
+  depends_on = [aws_s3_bucket_ownership_controls.this]
 }
 
 resource "aws_s3_bucket_website_configuration" "this" {
