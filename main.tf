@@ -1,7 +1,10 @@
+data "aws_region" "current" {}
+
 data "aws_canonical_user_id" "this" {}
 
 data "aws_caller_identity" "current" {}
 
+data "aws_partition" "current" {}
 locals {
   create_bucket = var.create_bucket && var.putin_khuylo
 
@@ -70,6 +73,7 @@ resource "aws_s3_bucket_acl" "this" {
     }
   }
 
+  # This `depends_on` is to prevent "AccessControlListNotSupported: The bucket does not allow ACLs."
   depends_on = [aws_s3_bucket_ownership_controls.this]
 }
 
@@ -520,25 +524,76 @@ data "aws_iam_policy_document" "combined" {
     var.attach_lb_log_delivery_policy ? data.aws_iam_policy_document.lb_log_delivery[0].json : "",
     var.attach_require_latest_tls_policy ? data.aws_iam_policy_document.require_latest_tls[0].json : "",
     var.attach_deny_insecure_transport_policy ? data.aws_iam_policy_document.deny_insecure_transport[0].json : "",
-    var.attach_inventory_destination_policy ? data.aws_iam_policy_document.inventory_destination_policy[0].json : "",
+    var.attach_inventory_destination_policy || var.attach_analytics_destination_policy ? data.aws_iam_policy_document.inventory_and_analytics_destination_policy[0].json : "",
     var.attach_policy ? var.policy : ""
   ])
 }
 
 # AWS Load Balancer access log delivery policy
-data "aws_elb_service_account" "this" {
-  count = local.create_bucket && var.attach_elb_log_delivery_policy ? 1 : 0
+locals {
+  # List of AWS regions where permissions should be granted to the specified Elastic Load Balancing account ID ( https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html#attach-bucket-policy )
+  elb_service_accounts = {
+    us-east-1      = "127311923021"
+    us-east-2      = "033677994240"
+    us-west-1      = "027434742980"
+    us-west-2      = "797873946194"
+    af-south-1     = "098369216593"
+    ap-east-1      = "754344448648"
+    ap-south-1     = "718504428378"
+    ap-northeast-1 = "582318560864"
+    ap-northeast-2 = "600734575887"
+    ap-northeast-3 = "383597477331"
+    ap-southeast-1 = "114774131450"
+    ap-southeast-2 = "783225319266"
+    ap-southeast-3 = "589379963580"
+    ca-central-1   = "985666609251"
+    eu-central-1   = "054676820928"
+    eu-west-1      = "156460612806"
+    eu-west-2      = "652711504416"
+    eu-west-3      = "009996457667"
+    eu-south-1     = "635631232127"
+    eu-north-1     = "897822967062"
+    me-south-1     = "076674570225"
+    sa-east-1      = "507241528517"
+    us-gov-west-1  = "048591011584"
+    us-gov-east-1  = "190560391635"
+  }
 }
 
 data "aws_iam_policy_document" "elb_log_delivery" {
   count = local.create_bucket && var.attach_elb_log_delivery_policy ? 1 : 0
 
+  # Policy for AWS Regions created before August 2022 (e.g. US East (N. Virginia), Asia Pacific (Singapore), Asia Pacific (Sydney), Asia Pacific (Tokyo), Europe (Ireland))
+  dynamic "statement" {
+    for_each = { for k, v in local.elb_service_accounts : k => v if k == data.aws_region.current.name }
+
+    content {
+      sid = format("ELBRegion%s", title(statement.key))
+
+      principals {
+        type        = "AWS"
+        identifiers = [format("arn:%s:iam::%s:root", data.aws_partition.current.partition, statement.value)]
+      }
+
+      effect = "Allow"
+
+      actions = [
+        "s3:PutObject",
+      ]
+
+      resources = [
+        "${aws_s3_bucket.this[0].arn}/*",
+      ]
+    }
+  }
+
+  # Policy for AWS Regions created after August 2022 (e.g. Asia Pacific (Hyderabad), Asia Pacific (Melbourne), Europe (Spain), Europe (Zurich), Middle East (UAE))
   statement {
     sid = ""
 
     principals {
-      type        = "AWS"
-      identifiers = data.aws_elb_service_account.this[*].arn
+      type        = "Service"
+      identifiers = ["logdelivery.elasticloadbalancing.amazonaws.com"]
     }
 
     effect = "Allow"
@@ -554,7 +609,6 @@ data "aws_iam_policy_document" "elb_log_delivery" {
 }
 
 # ALB/NLB
-
 data "aws_iam_policy_document" "lb_log_delivery" {
   count = local.create_bucket && var.attach_lb_log_delivery_policy ? 1 : 0
 
@@ -794,13 +848,13 @@ resource "aws_s3_bucket_inventory" "this" {
   }
 }
 
-# Inventory destination bucket requires a bucket policy to allow source to PutObjects
+# Inventory and analytics destination bucket requires a bucket policy to allow source to PutObjects
 # https://docs.aws.amazon.com/AmazonS3/latest/userguide/example-bucket-policies.html#example-bucket-policies-use-case-9
-data "aws_iam_policy_document" "inventory_destination_policy" {
-  count = local.create_bucket && var.attach_inventory_destination_policy ? 1 : 0
+data "aws_iam_policy_document" "inventory_and_analytics_destination_policy" {
+  count = local.create_bucket && var.attach_inventory_destination_policy || var.attach_analytics_destination_policy ? 1 : 0
 
   statement {
-    sid    = "destinationInventoryPolicy"
+    sid    = "destinationInventoryAndAnalyticsPolicy"
     effect = "Allow"
 
     actions = [
@@ -819,16 +873,18 @@ data "aws_iam_policy_document" "inventory_destination_policy" {
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
-      values = [
-        var.inventory_self_source_destination ? aws_s3_bucket.this[0].arn : var.inventory_source_bucket_arn
-      ]
+      values = compact(distinct([
+        var.inventory_self_source_destination ? aws_s3_bucket.this[0].arn : var.inventory_source_bucket_arn,
+        var.analytics_self_source_destination ? aws_s3_bucket.this[0].arn : var.analytics_source_bucket_arn
+      ]))
     }
 
     condition {
       test = "StringEquals"
-      values = [
-        var.inventory_self_source_destination ? data.aws_caller_identity.current.id : var.inventory_source_account_id
-      ]
+      values = compact(distinct([
+        var.inventory_self_source_destination ? data.aws_caller_identity.current.id : var.inventory_source_account_id,
+        var.analytics_self_source_destination ? data.aws_caller_identity.current.id : var.analytics_source_account_id
+      ]))
       variable = "aws:SourceAccount"
     }
 
@@ -836,6 +892,43 @@ data "aws_iam_policy_document" "inventory_destination_policy" {
       test     = "StringEquals"
       values   = ["bucket-owner-full-control"]
       variable = "s3:x-amz-acl"
+    }
+  }
+}
+
+resource "aws_s3_bucket_analytics_configuration" "this" {
+  for_each = { for k, v in var.analytics_configuration : k => v if local.create_bucket }
+
+  bucket = aws_s3_bucket.this[0].id
+  name   = each.key
+
+  dynamic "filter" {
+    for_each = length(try(flatten([each.value.filter]), [])) == 0 ? [] : [true]
+
+    content {
+      prefix = try(each.value.filter.prefix, null)
+      tags   = try(each.value.filter.tags, null)
+    }
+  }
+
+  dynamic "storage_class_analysis" {
+    for_each = length(try(flatten([each.value.storage_class_analysis]), [])) == 0 ? [] : [true]
+
+    content {
+
+      data_export {
+        output_schema_version = try(each.value.storage_class_analysis.output_schema_version, null)
+
+        destination {
+
+          s3_bucket_destination {
+            bucket_arn        = try(each.value.storage_class_analysis.destination_bucket_arn, aws_s3_bucket.this[0].arn)
+            bucket_account_id = try(each.value.storage_class_analysis.destination_account_id, data.aws_caller_identity.current.id)
+            format            = try(each.value.storage_class_analysis.export_format, "CSV")
+            prefix            = try(each.value.storage_class_analysis.export_prefix, null)
+          }
+        }
+      }
     }
   }
 }
