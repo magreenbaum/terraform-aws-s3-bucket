@@ -67,7 +67,6 @@ module "log_bucket" {
   source = "../../"
 
   bucket        = "logs-${random_pet.this.id}"
-  acl           = "log-delivery-write"
   force_destroy = true
 
   attach_elb_log_delivery_policy        = true
@@ -80,6 +79,9 @@ module "cloudfront_log_bucket" {
   source = "../../"
 
   bucket = "cloudfront-logs-${random_pet.this.id}"
+
+  control_object_ownership = true
+  object_ownership         = "BucketOwnerPreferred"
 
   grant = [{
     type       = "CanonicalUser"
